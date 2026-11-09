@@ -4649,7 +4649,7 @@ Filter_IP() {
 }
 
 Filter_IPLine() {
-	grep -E '(((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])\.){3}(25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9]))([[:space:]]|$)'
+	grep -E '(((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])\.){3}(25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9]))(/[0-9]{1,2})?([[:space:]]|$)'
 }
 
 Filter_OutIP() {
@@ -4730,8 +4730,10 @@ Domain_Lookup() {
 			# Address records outside the query section belong to the DNS server block.
 			in_query && /Address/ {
 				for (i = 1; i <= NF; i++) {
-					if ($i ~ /^((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])\.){3}(25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])$/ && !seen[$i]++)
-						print $i
+					if ($i ~ /^((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])\.){3}(25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])$/) {
+						if (!seen[$i]++) print $i
+						break
+					}
 				}
 			}
 		' "$lookupresultfile" > "$lookupanswerfile"; then
@@ -13426,6 +13428,8 @@ Restore_Startup_Policy() {
 	Whitelist_Extra || { Log error -s "Failed To Prepare Shared Whitelist"; return 1; }
 	Apply_Rule_Registry_Candidate "$skynetrules" startup || { Log error -s "Failed To Compile User Rules"; return 1; }
 	Update_Domain_Rules "$skynetrules" startup || { Log error -s "Failed To Restore Cached Domain Rules"; return 1; }
+	# Enforce the restored policy before optional DNS/VPN/dnsmasq work can fail or stall.
+	Reconcile_Firewall_Rules || return 1
 	Whitelist_Blocked_Private_IPs || { Log error -s "Failed To Whitelist Private Networks"; return 1; }
 	Whitelist_VPN || { Log error -s "Failed To Restore VPN Whitelist"; return 1; }
 	Whitelist_Shared || { Log error -s "Failed To Restore Shared Whitelist"; return 1; }
@@ -13511,6 +13515,11 @@ Dispatch_Start() {
 	# Keep failed cold initialization eligible for retry until policy is verified.
 	: > "$STARTUP_PENDING" && chmod 600 "$STARTUP_PENDING" || return 1
 	rm -f "$STARTUP_READY" || return 1
+	startupswapwait="0"
+	while Swap_Required && ! Check_Swap && [ "$startupswapwait" -lt 150 ]; do
+		sleep 5
+		startupswapwait=$((startupswapwait + 5))
+	done
 	Check_Settings || { echo; return 1; }
 	Restore_Startup_Policy || { echo; return 1; }
 	if Time_Is_Ready && Time_Dependent_State_Pending; then
@@ -13689,6 +13698,12 @@ Dispatch_Update() {
 	if [ -z "$remotever" ]; then
 		rm -f "$updatetmp"
 		Log error "Invalid Update File Detected"
+		echo
+		exit 1
+	fi
+	if [ "$2" != "-f" ] && ! printf '%s\n%s\n' "$(Filter_Version < "$0" | head -n 1)" "$remotever" | tr -d v | awk -F. 'NR==1 {a=$1*10000+$2*100+$3; next} {exit !($1*10000+$2*100+$3>=a)}'; then
+		rm -f "$updatetmp"
+		Log error "Refusing Downgrade To $remotever"
 		echo
 		exit 1
 	fi
@@ -17159,7 +17174,7 @@ domainemptythreshold="2"
 
 # Default to the NVRAM’s WAN interface name, but if the protocol is PPPoE, override to ppp0
 iface="$(nvram get wan0_ifname)"
-[ "$(nvram get wan0_proto)" = "pppoe" ] && iface="ppp0"
+case "$(nvram get wan0_proto)" in pppoe|pptp|l2tp) iface="ppp0" ;; esac
 
 Set_Cleanup_Traps
 
