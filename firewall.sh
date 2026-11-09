@@ -294,7 +294,15 @@ Check_Lock() {
 	exec 9<>"$LOCK_FILE"
 	chmod 600 "$LOCK_FILE" || { exec 9>&-; return 1; }
 
-	# Never queue interactive commands behind a long-running update.
+	# Scheduled jobs wait their turn, or a job in the same minute would lose its run.
+	# Interactive commands never queue behind a long-running update.
+	lockcronwait="0"
+	if [ "${SKYNET_ACTION_ORIGIN:-}" = "cron" ]; then
+		while ! flock -n 9 && [ "$lockcronwait" -lt 150 ]; do
+			sleep 2
+			lockcronwait=$((lockcronwait + 1))
+		done
+	fi
 	if ! flock -n 9; then
 		IFS='|' read -r locked_cmd locked_pid lock_timestamp < "$LOCK_FILE"
 		lockcurrenttime="$(date +%s)"
@@ -333,7 +341,9 @@ Check_Lock() {
 		return 1
 	}
 	state_lock_held="1"
-	unset "locked_cmd" "locked_pid" "lock_timestamp" "lockcurrenttime" "lockage"
+	# Settings read before the wait may be stale, and the footer writes them back.
+	if [ "$lockcronwait" != "0" ] && [ -f "$skynetcfg" ]; then Load_Config || return 1; fi
+	unset "locked_cmd" "locked_pid" "lock_timestamp" "lockcurrenttime" "lockage" "lockcronwait"
 }
 
 Wait_For_Lock() {
@@ -453,6 +463,7 @@ Find_Install_Dir() {
 
 		# Final verification
 		if [ ! -d "$skynetloc" ] || [ ! -w "$skynetloc" ]; then
+			[ "$1" != "start" ] || cru a Skynet_startretry "*/5 * * * * SKYNET_ACTION_ORIGIN=cron sh /jffs/scripts/firewall start"
 			Log error -s "Problem with USB install location — please fix immediately!"
 			Log error -s "To change location run: sh $0 install"
 			echo
@@ -3794,7 +3805,7 @@ Unload_IPSets() {
 Unload_Cron() {
 	# If no argument or "all", reset $@ to the full list
 	if [ -z "$1" ] || [ "$1" = "all" ]; then
-		set -- "save" "maintenance" "collect" "banmalware" "autoupdate" "checkupdate" "genstats" "rules" "countries"
+		set -- "save" "maintenance" "collect" "banmalware" "autoupdate" "checkupdate" "genstats" "rules" "countries" "startretry"
 	fi
 
 	cronstatus="0"
@@ -3802,6 +3813,9 @@ Unload_Cron() {
 		case "$job" in
 			save)
 				cru d Skynet_save || cronstatus="1"
+			;;
+			startretry)
+				cru d Skynet_startretry || cronstatus="1"
 			;;
 			maintenance)
 				cru d Skynet_maintenance || cronstatus="1"
@@ -10126,7 +10140,7 @@ Filter_Syslog_Cleanup() {
 	awk -v uninstall="${sysloguninstall:-0}" -v requirechange="${2:-0}" '
 		/kernel: (\[[^]]*\] )?\[BLOCKED - (INBOUND|OUTBOUND|INVALID|IOT|FIREWALL)\]/ {removed=1; next}
 		uninstall == 1 && /(^|[[:space:]])Skynet(\[[0-9]+\])?:/ {removed=1; next}
-		uninstall != 1 && /kernel: DROP IN=/ {removed=1; next}
+		uninstall != 1 && /^[A-Z][a-z][a-z] +[0-9]+ [0-9:]+ ([^ :]+ )?kernel: (\[[^]]*\] )?DROP IN=/ {removed=1; next}
 		{print}
 		END {if (requirechange == 1 && !removed) exit 3}
 	' "$1"
@@ -14589,6 +14603,7 @@ Dispatch_WebUI() {
 		;;
 		SkynetIOT|iot)
 			Check_Lock "$@" || return 1
+			Load_Config || return 1
 			Apply_WebUI_IOT || commandfailed="$?"
 		;;
 		*)
@@ -17169,6 +17184,10 @@ if [ -z "$skynetloc" ] && tty >/dev/null 2>&1; then
 fi
 
 stime="$(Uptime_Seconds)"
+# A retried start never queues behind another command; the next retry tries again.
+if [ "$1" = "start" ] && [ "${SKYNET_ACTION_ORIGIN:-}" = "cron" ] && [ -f "$LOCK_FILE" ] && ! flock -n 9 9<"$LOCK_FILE"; then
+	exit 0
+fi
 Find_Install_Dir "$@" || exit 1
 
 # Scheduled collection exits before interactive setup and the command footer.
@@ -17250,6 +17269,13 @@ if [ "$1" = "start" ] && [ "$commandstatus" = "0" ]; then
 	# Confirm protection before optional history migration, charts and downloads.
 	# Large legacy logs on slower routers must not exhaust the updater's wait.
 	Confirm_Firewall_Ready || commandstatus="1"
+fi
+if [ "$1" = "start" ]; then
+	if [ "$commandstatus" = "0" ]; then
+		cru d Skynet_startretry
+	else
+		cru a Skynet_startretry "*/5 * * * * SKYNET_ACTION_ORIGIN=cron sh /jffs/scripts/firewall start"
+	fi
 fi
 if [ "$1" = "start" ] && [ "$commandstatus" = "0" ]; then
 	if [ "${startupcollect:-0}" = "1" ]; then Purge_Logs "all" || true; fi
