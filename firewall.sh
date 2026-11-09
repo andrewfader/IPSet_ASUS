@@ -703,7 +703,7 @@ Curl_Fetch() {
 	# 403 must return immediately so callers can retain their validated data.
 	# Keep stdout (including country HTTP status codes) separate from diagnostics.
 	# Capture stderr per invocation so parallel downloads cannot mix their errors.
-	if curlerror="$(curl -fsSL --proto '=http,https' --proto-redir '=http,https' \
+	if curlerror="$(curl -fsSL --proto '=http,https' --proto-redir '=http,https' --max-filesize 67108864 \
 		--retry 3 --connect-timeout 5 --max-time 60 --retry-delay 1 "$@" 2>&1 1>&3)" 3>&1; then
 		return 0
 	fi
@@ -5548,15 +5548,15 @@ Whitelist_Blocked_Private_IPs() {
 			function private_ip(ip) {
 				return ip ~ /^(0\.|10\.|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.0\.0\.|192\.0\.2\.|192\.168\.|198\.(1[8-9])\.|198\.51\.100\.|203\.0\.113\.|2(2[4-9]|[3-4][0-9]|5[0-5])\.)/
 			}
-			/kernel: (\[[^]]*\] )?\[BLOCKED - INBOUND\]/ { field = "SRC=" }
-			/kernel: (\[[^]]*\] )?\[BLOCKED - OUTBOUND\]/ { field = "DST=" }
+			/^[A-Z][a-z][a-z] +[0-9]+ [0-9:]+ ([^ :]+ )?kernel: (\[[^]]*\] )?\[BLOCKED - INBOUND\]/ { field = "SRC=" }
+			/^[A-Z][a-z][a-z] +[0-9]+ [0-9:]+ ([^ :]+ )?kernel: (\[[^]]*\] )?\[BLOCKED - OUTBOUND\]/ { field = "DST=" }
 			!field { next }
 			{
 				for (i = 1; i <= NF; i++) {
 					if (index($i, field) != 1) continue
 					ip = substr($i, length(field) + 1)
 					sub(/,.*/, "", ip)
-					if (private_ip(ip) && !seen[ip]++) {
+					if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && private_ip(ip) && !seen[ip]++) {
 						printf "add Skynet-Whitelist %s comment \"Private IP\"\n", ip
 						printf "del Skynet-Blacklist %s\n", ip
 					}
@@ -5897,6 +5897,9 @@ Fetch_CDN_Whitelist() {
 			&& Normalize_Public_IPList "$cdnworkervalues" "$cdnworkerraw" \
 			&& [ -s "$cdnworkerraw" ]; then
 			awk -v label="$cdnworkerlabel" '{
+				split($1, cidr, "/"); prefix = (cidr[2] == "") ? 32 : cidr[2] + 0
+				if (prefix < 8) exit 1
+				covered += 2 ^ (32 - prefix); if (covered > 268435456) exit 1
 				printf "add Skynet-Whitelist %s comment \"CDN-Whitelist: %s\"\n", $1, label
 			}' "$cdnworkerraw" > "$cdnworkeroutput" && [ -s "$cdnworkeroutput" ] && cdnworkerparsed="1"
 		fi
@@ -6945,6 +6948,7 @@ Build_Stats_Domain_Cache() {
 			sub(/^http[s]*:\/\//, "", domain)
 			sub(/\/.*/, "", domain)
 			sub(/^www\./, "", domain)
+			if (domain !~ /^[A-Za-z0-9._-]+$/) next
 			key = ip SUBSEP domain
 			if (domain != "" && !seen[key]++) {
 				if (domains[ip] == "") domains[ip] = domain
@@ -9045,7 +9049,7 @@ Download_File() {
 	downloadname="$(basename "$downloadfile")"
 	downloadtmp="${downloaddest}.tmp.$$"
 
-	if ! Curl_Fetch -o "$downloadtmp" "$downloadurl" || [ ! -s "$downloadtmp" ]; then
+	if ! Curl_Fetch --proto '=https' --proto-redir '=https' -o "$downloadtmp" "$downloadurl" || [ ! -s "$downloadtmp" ]; then
 		rm -f "$downloadtmp"
 		Log error "Failed To Update $downloadname"
 		return 1
@@ -9980,7 +9984,7 @@ History_Parse_Batch() {
 			split("FIN SYN RST PSH ACK URG ECE CWR",flagname," ")
 			for(i=1;i<=8;i++) flagvalue[flagname[i]]=2^(i-1)
 		}
-		/kernel: (\[[^]]*\] )?\[BLOCKED - (INBOUND|OUTBOUND|INVALID|IOT|FIREWALL)\]/ {
+		/^[A-Z][a-z][a-z] +[0-9]+ [0-9:]+ ([^ :]+ )?kernel: (\[[^]]*\] )?\[BLOCKED - (INBOUND|OUTBOUND|INVALID|IOT|FIREWALL)\]/ {
 			kind=index($0,"[BLOCKED - INBOUND]") ? 1 : index($0,"[BLOCKED - OUTBOUND]") ? 2 : index($0,"[BLOCKED - INVALID]") ? 3 : index($0,"[BLOCKED - IOT]") ? 4 : index($0,"[BLOCKED - FIREWALL]") ? 5 : 0
 			m=month[$1]; d=$2; split($3,clock,":")
 			if(!kind || !m || d !~ /^[0-9]+$/ || d<1 || d>mdays[m]+(m==2) || $3 !~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ || clock[1]>23 || clock[2]>59 || clock[3]>59) next
@@ -10124,7 +10128,7 @@ Filter_Syslog_Cleanup() {
 	# During uninstall discard only Skynet-owned messages. Generic firmware DROP
 	# records remain in syslog; ordinary collection still archives those records.
 	awk -v uninstall="${sysloguninstall:-0}" -v requirechange="${2:-0}" '
-		/kernel: (\[[^]]*\] )?\[BLOCKED - (INBOUND|OUTBOUND|INVALID|IOT|FIREWALL)\]/ {removed=1; next}
+		/^[A-Z][a-z][a-z] +[0-9]+ [0-9:]+ ([^ :]+ )?kernel: (\[[^]]*\] )?\[BLOCKED - (INBOUND|OUTBOUND|INVALID|IOT|FIREWALL)\]/ {removed=1; next}
 		uninstall == 1 && /(^|[[:space:]])Skynet(\[[0-9]+\])?:/ {removed=1; next}
 		uninstall != 1 && /kernel: DROP IN=/ {removed=1; next}
 		{print}
